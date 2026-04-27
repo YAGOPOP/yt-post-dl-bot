@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use linkify::{LinkFinder, LinkKind};
 use reqwest::{Client, header};
 use std::collections::HashSet;
@@ -7,17 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use url::Url;
-
-type ResultAsyncDyn<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 use teloxide::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    
     pretty_env_logger::init();
     log::info!("Starting throw dice bot...");
 
     let bot = Bot::from_env();
-    let client = Client::builder().tls_backend_native().build()?;
+    let client = Client::builder().use_native_tls().build()?;
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let client = client.clone();
@@ -105,33 +105,38 @@ fn is_domain_or_subdomain(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn figure_out_response_file_extension(hv: &header::HeaderMap) -> ResultAsyncDyn<&'static str> {
-    match hv.get(header::CONTENT_TYPE) {
-        Some(t) => match t.to_str()? {
-            "image/jpeg" => Ok("jpeg"),
-            "image/gif" => Ok("gif"),
-            "image/png" => Ok("png"),
-            ut => {
-                return Err(
-                    format!("Ошибка: не предусмотренный тип контента в ответе: {}", ut).into(),
-                );
-            }
-        },
-        None => {
-            return Err(
-                "Ошибка: в ответе от сервера на запрос по прямой ссылке картинки нет контента."
-                    .into(),
-            );
-        }
+fn figure_out_response_file_extension(hv: &header::HeaderMap) -> anyhow::Result<&'static str> {
+    let content_type = hv
+        .get(header::CONTENT_TYPE)
+        .context("Ошибка: в ответе от сервера на запрос по прямой ссылке картинки нет контента.")?
+        .to_str()
+        .context("Ошибка: некорректный CONTENT_TYPE в ответе сервера.")?;
+
+    match content_type {
+        "image/jpeg" => Ok("jpeg"),
+        "image/gif" => Ok("gif"),
+        "image/png" => Ok("png"),
+        other => bail!("Ошибка: не предусмотренный тип контента в ответе: {other}"),
     }
 }
 
 async fn get_img_links_from_post(
     indirect_url: &str,
     client: &Client,
-) -> ResultAsyncDyn<HashSet<String>> {
-    let resp = client.get(indirect_url).send().await?.error_for_status()?;
-    let resp_text = resp.text().await?;
+) -> anyhow::Result<HashSet<String>> {
+    let resp = client
+        .get(indirect_url)
+        .send()
+        .await
+        .with_context(|| format!("Не удалось отправить запрос к {indirect_url}"))?
+        .error_for_status()
+        .with_context(|| format!("Сервер вернул ошибочный статус для {indirect_url}"))?;
+
+    let resp_text = resp
+        .text()
+        .await
+        .context("Не удалось прочитать тело ответа.")?;
+
     let img_urls = extract_links(&resp_text, sanitize_ggpht_url);
 
     Ok(img_urls)
