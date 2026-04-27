@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use teloxide::types::InputFile;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 use teloxide::prelude::*;
@@ -12,7 +13,6 @@ use teloxide::prelude::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    
     pretty_env_logger::init();
     log::info!("Starting throw dice bot...");
 
@@ -25,30 +25,7 @@ async fn main() -> anyhow::Result<()> {
         async move {
             let chat_id = msg.chat.id;
 
-            match msg.text() {
-                Some(msg_txt) => {
-                    let post_urls = extract_links(msg_txt, sanitize_yt_post_url);
-                    for post_url in post_urls {
-                        let img_urls = match get_img_links_from_post(&post_url, &client).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                bot.send_message(chat_id, format!("Ошибка зпроса: {:?}", e)).await?;
-                                HashSet::new()
-                            }
-                        };
-                        for img_url in img_urls {
-                            bot.send_message(chat_id, img_url).await?;
-                        }
-                    }
-                }
-                None => {
-                    bot.send_message(
-                        chat_id,
-                        "Пожалуйста, отправьте ссылку на пост в сообществе YouTube.",
-                    )
-                    .await?;
-                }
-            };
+            process_pessage(&bot, msg, client, chat_id);
             Ok(())
         }
     })
@@ -57,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn extract_links(text: &str, sanitize: fn(Url) -> Option<String>) -> HashSet<String> {
+fn extract_links(text: &str, sanitize: fn(Url) -> Option<Url>) -> HashSet<Url> {
     let mut res = HashSet::new();
 
     let mut finder = LinkFinder::new();
@@ -75,27 +52,40 @@ fn extract_links(text: &str, sanitize: fn(Url) -> Option<String>) -> HashSet<Str
     res
 }
 
-fn sanitize_yt_post_url(mut url: Url) -> Option<String> {
+fn sanitize_yt_post_url(mut url: Url) -> Option<Url> {
     let host = url.host_str()?;
+
     if !is_domain_or_subdomain(host, "youtube.com") {
         return None;
     }
+
     if url.path_segments()?.next() != Some("post") {
         return None;
     }
-    url.set_query(None);
 
-    Some(url.as_str().to_owned())
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Some(url)
 }
 
-fn sanitize_ggpht_url(url: Url) -> Option<String> {
+fn sanitize_ggpht_url(mut url: Url) -> Option<Url> {
     if url.host_str()? != "yt3.ggpht.com" {
         return None;
     }
-    let str_url = url.as_str();
-    let i = str_url.find("=")?;
 
-    Some(format!("{}s0", &str_url[..=i]))
+    let path = url.path();
+    let i = path.rfind('=')?;
+
+    let mut new_path = String::with_capacity(i + 1 + 2);
+    new_path.push_str(&path[..=i]);
+    new_path.push_str("s0");
+
+    url.set_path(&new_path);
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Some(url)
 }
 
 fn is_domain_or_subdomain(host: &str, domain: &str) -> bool {
@@ -121,23 +111,46 @@ fn figure_out_response_file_extension(hv: &header::HeaderMap) -> anyhow::Result<
 }
 
 async fn get_img_links_from_post(
-    indirect_url: &str,
+    indirect_url: Url,
     client: &Client,
-) -> anyhow::Result<HashSet<String>> {
-    let resp = client
-        .get(indirect_url)
-        .send()
-        .await
-        .with_context(|| format!("Не удалось отправить запрос к {indirect_url}"))?
-        .error_for_status()
-        .with_context(|| format!("Сервер вернул ошибочный статус для {indirect_url}"))?;
-
-    let resp_text = resp
-        .text()
-        .await
-        .context("Не удалось прочитать тело ответа.")?;
-
+) -> ResultAsyncDyn<HashSet<Url>> {
+    let resp = client.get(indirect_url).send().await?.error_for_status()?;
+    let resp_text = resp.text().await?;
     let img_urls = extract_links(&resp_text, sanitize_ggpht_url);
 
     Ok(img_urls)
+}
+
+async fn process_pessage(
+    bot: &Bot,
+    msg: Message,
+    client: Client,
+    chat_id: ChatId,
+) -> ResultAsyncDyn<()> {
+    match msg.text() {
+        Some(msg_txt) => {
+            let post_urls = extract_links(msg_txt, sanitize_yt_post_url);
+            for post_url in post_urls {
+                let img_urls = match get_img_links_from_post(post_url, &client).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        bot.send_message(chat_id, format!("Ошибка зпроса: {:?}", e))
+                            .await?;
+                        HashSet::new()
+                    }
+                };
+                for img_url in img_urls {
+                    bot.send_photo(chat_id, InputFile::url(img_url)).await?;
+                }
+            }
+        }
+        None => {
+            bot.send_message(
+                chat_id,
+                "Пожалуйста, отправьте ссылку на пост в сообществе YouTube.",
+            )
+            .await?;
+        }
+    };
+    Ok(())
 }
