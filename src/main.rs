@@ -1,14 +1,11 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use linkify::{LinkFinder, LinkKind};
 use reqwest::{Client, header};
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use teloxide::types::InputFile;
-use tokio::io::AsyncWriteExt;
-use url::Url;
+// use std::sync::atomic::{AtomicUsize, Ordering};
 use teloxide::prelude::*;
+use teloxide::types::InputFile;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,9 +20,9 @@ async fn main() -> anyhow::Result<()> {
         let client = client.clone();
 
         async move {
-            let chat_id = msg.chat.id;
-
-            process_pessage(&bot, msg, client, chat_id);
+            if let Err(e) = process_message(&bot, msg, client).await {
+                log::error!("process_message failed: {:?}", e);
+            }
             Ok(())
         }
     })
@@ -75,7 +72,7 @@ fn sanitize_ggpht_url(mut url: Url) -> Option<Url> {
     }
 
     let path = url.path();
-    let i = path.rfind('=')?;
+    let i = path.find('=')?;
 
     let mut new_path = String::with_capacity(i + 1 + 2);
     new_path.push_str(&path[..=i]);
@@ -113,7 +110,7 @@ fn figure_out_response_file_extension(hv: &header::HeaderMap) -> anyhow::Result<
 async fn get_img_links_from_post(
     indirect_url: Url,
     client: &Client,
-) -> ResultAsyncDyn<HashSet<Url>> {
+) -> anyhow::Result<HashSet<Url>> {
     let resp = client.get(indirect_url).send().await?.error_for_status()?;
     let resp_text = resp.text().await?;
     let img_urls = extract_links(&resp_text, sanitize_ggpht_url);
@@ -121,12 +118,9 @@ async fn get_img_links_from_post(
     Ok(img_urls)
 }
 
-async fn process_pessage(
-    bot: &Bot,
-    msg: Message,
-    client: Client,
-    chat_id: ChatId,
-) -> ResultAsyncDyn<()> {
+async fn process_message(bot: &Bot, msg: Message, client: Client) -> anyhow::Result<()> {
+    let chat_id = msg.chat.id;
+
     match msg.text() {
         Some(msg_txt) => {
             let post_urls = extract_links(msg_txt, sanitize_yt_post_url);
@@ -140,7 +134,19 @@ async fn process_pessage(
                     }
                 };
                 for img_url in img_urls {
-                    bot.send_photo(chat_id, InputFile::url(img_url)).await?;
+                    match download_image_to_memory(img_url.clone(), &client).await {
+                        Ok(photo) => {
+                            bot.send_document(chat_id, photo).await?;
+                        }
+                        Err(e) => {
+                            log::warn!("failed to download image {img_url}: {e:?}");
+                            let err_resp_text = format!(
+                                "не удалось скачать, какая-то проблема {e:?} со ссылкой:\n\n{}",
+                                img_url.to_string()
+                            );
+                            bot.send_message(chat_id, err_resp_text).await?;
+                        }
+                    }
                 }
             }
         }
@@ -153,4 +159,13 @@ async fn process_pessage(
         }
     };
     Ok(())
+}
+
+async fn download_image_to_memory(img_url: Url, client: &Client) -> anyhow::Result<InputFile> {
+    let resp = client.get(img_url).send().await?.error_for_status()?;
+
+    let ext = figure_out_response_file_extension(resp.headers())?;
+    let bytes = resp.bytes().await?;
+
+    Ok(InputFile::memory(bytes).file_name(format!("image.{ext}")))
 }
