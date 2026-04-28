@@ -1,34 +1,67 @@
 use anyhow::{Context, bail};
 use linkify::{LinkFinder, LinkKind};
 use reqwest::{Client, header};
+// use teloxide::dispatching::dialogue::GetChatId;
 use std::collections::HashSet;
 // use std::sync::atomic::{AtomicUsize, Ordering};
-use teloxide::prelude::*;
 use teloxide::types::InputFile;
+use teloxide::{prelude::*, utils::command::BotCommands};
 use url::Url;
+
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase", description = "Доступные команды:")]
+enum Command {
+    #[command(description = "запустить бота")]
+    Start,
+    #[command(description = "показать помощь")]
+    Help,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     pretty_env_logger::init();
-    log::info!("Starting throw dice bot...");
+    log::info!("Starting bot...");
 
     let bot = Bot::from_env();
+    bot.set_my_commands(Command::bot_commands())
+        .await
+        .expect("Не удалось установить команды");
     let client = Client::builder().use_native_tls().build()?;
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let client = client.clone();
+    let handler = Update::filter_message()
+        .branch(teloxide::filter_command::<Command, _>().endpoint(command_handler))
+        .branch(Message::filter_text().endpoint(text_handler))
+        .branch(dptree::endpoint(other_message_handler));
 
-        async move {
-            if let Err(e) = process_message(&bot, msg, client).await {
-                log::error!("process_message failed: {:?}", e);
-            }
-            Ok(())
-        }
-    })
-    .await;
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![client])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
 
     Ok(())
+}
+
+async fn command_handler(bot: Bot, msg: Message, cmd: Command) -> anyhow::Result<()> {
+    match cmd {
+        Command::Start => {
+            bot.send_message(msg.chat.id, "Отправьте текст с ссылкой(ами) на пост(ы) в сообществе YouTube.")
+                .await?;
+        }
+        Command::Help => {
+            bot.send_message(msg.chat.id, Command::descriptions().to_string())
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn text_handler(bot: Bot, msg: Message, text: String, client: Client) -> anyhow::Result<()> {
+    // log::info!("{:?}", msg.text());
+    process_text(&bot, msg.chat.id, &text, client).await
 }
 
 fn extract_links(text: &str, sanitize: fn(Url) -> Option<Url>) -> HashSet<Url> {
@@ -92,8 +125,10 @@ fn is_domain_or_subdomain(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn figure_out_response_file_extension(hv: &header::HeaderMap) -> anyhow::Result<&'static str> {
-    let content_type = hv
+fn figure_out_response_file_extension(
+    header_value: &header::HeaderMap,
+) -> anyhow::Result<&'static str> {
+    let content_type = header_value
         .get(header::CONTENT_TYPE)
         .context("Ошибка: в ответе от сервера на запрос по прямой ссылке картинки нет контента.")?
         .to_str()
@@ -118,12 +153,17 @@ async fn get_img_links_from_post(
     Ok(img_urls)
 }
 
-async fn process_message(bot: &Bot, msg: Message, client: Client) -> anyhow::Result<()> {
-    let chat_id = msg.chat.id;
-
-    match msg.text() {
-        Some(msg_txt) => {
-            let post_urls = extract_links(msg_txt, sanitize_yt_post_url);
+async fn process_text(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    client: Client,
+) -> anyhow::Result<()> {
+            let post_urls = extract_links(text, sanitize_yt_post_url);
+            if post_urls.len() == 0 {
+            bot.send_message(chat_id, "Не удалось найти ссылку(и) на пост(ы) в сообществе YouTube в тексте соообщения.").await?;
+            return Ok(());
+            }
             for post_url in post_urls {
                 let img_urls = match get_img_links_from_post(post_url, &client).await {
                     Ok(v) => v,
@@ -149,15 +189,7 @@ async fn process_message(bot: &Bot, msg: Message, client: Client) -> anyhow::Res
                     }
                 }
             }
-        }
-        None => {
-            bot.send_message(
-                chat_id,
-                "Пожалуйста, отправьте ссылку на пост в сообществе YouTube.",
-            )
-            .await?;
-        }
-    };
+
     Ok(())
 }
 
@@ -168,4 +200,14 @@ async fn download_image_to_memory(img_url: Url, client: &Client) -> anyhow::Resu
     let bytes = resp.bytes().await?;
 
     Ok(InputFile::memory(bytes).file_name(format!("image.{ext}")))
+}
+
+async fn other_message_handler(bot: Bot, msg: Message) -> anyhow::Result<()> {
+    bot.send_message(
+        msg.chat.id,
+        "Отправьте текст с ссылкой(ами) на пост(ы) в сообществе YouTube.",
+    )
+    .await?;
+
+    Ok(())
 }
