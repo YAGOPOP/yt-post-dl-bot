@@ -4,9 +4,11 @@ use reqwest::{Client, header};
 // use teloxide::dispatching::dialogue::GetChatId;
 use std::collections::HashSet;
 // use std::sync::atomic::{AtomicUsize, Ordering};
-use teloxide::types::InputFile;
+use teloxide::types::InputMedia;
+use teloxide::types::{InputFile, InputMediaDocument};
 use teloxide::{prelude::*, utils::command::BotCommands};
 use url::Url;
+// use indexmap::IndexSet;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Доступные команды:")]
@@ -21,9 +23,11 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     pretty_env_logger::init();
-    log::info!("Starting bot...");
 
+    log::info!("Starting bot...");
     let bot = Bot::from_env();
+    log::info!("Bot started successfully.");
+
     bot.set_my_commands(Command::bot_commands())
         .await
         .expect("Не удалось установить команды");
@@ -47,8 +51,11 @@ async fn main() -> anyhow::Result<()> {
 async fn command_handler(bot: Bot, msg: Message, cmd: Command) -> anyhow::Result<()> {
     match cmd {
         Command::Start => {
-            bot.send_message(msg.chat.id, "Отправьте текст с ссылкой(ами) на пост(ы) в сообществе YouTube.")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Отправьте текст с ссылкой(ами) на пост(ы) в сообществе YouTube.",
+            )
+            .await?;
         }
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string())
@@ -61,7 +68,17 @@ async fn command_handler(bot: Bot, msg: Message, cmd: Command) -> anyhow::Result
 
 async fn text_handler(bot: Bot, msg: Message, text: String, client: Client) -> anyhow::Result<()> {
     // log::info!("{:?}", msg.text());
-    process_text(&bot, msg.chat.id, &text, client).await
+    // bot.send_chat_action(msg.chat.id, ChatAction::UploadPhoto).await?;
+
+    let status_msg = bot
+        .send_message(msg.chat.id, "Обрабатываю сообщение...")
+        .await?;
+
+    // process_message(&bot, msg, client).await?;
+    process_text(&bot, msg.chat.id, &text, client).await?;
+
+    bot.delete_message(msg.chat.id, status_msg.id).await?;
+    Ok(())
 }
 
 fn extract_links(text: &str, sanitize: fn(Url) -> Option<Url>) -> HashSet<Url> {
@@ -159,36 +176,53 @@ async fn process_text(
     text: &str,
     client: Client,
 ) -> anyhow::Result<()> {
-            let post_urls = extract_links(text, sanitize_yt_post_url);
-            if post_urls.len() == 0 {
-            bot.send_message(chat_id, "Не удалось найти ссылку(и) на пост(ы) в сообществе YouTube в тексте соообщения.").await?;
-            return Ok(());
+    let post_urls = extract_links(text, sanitize_yt_post_url);
+    if post_urls.len() == 0 {
+        bot.send_message(
+            chat_id,
+            "Не удалось найти ссылку(и) на пост(ы) в сообществе YouTube в тексте соообщения.",
+        )
+        .await?;
+        return Ok(());
+    }
+    for post_url in post_urls {
+        let img_urls = match get_img_links_from_post(post_url.clone(), &client).await {
+            Ok(v) => v,
+            Err(e) => {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "не удалось получить ссылки на картинки из поста: {}",
+                        post_url.as_str()
+                    ),
+                )
+                .await?;
+                log::warn!(
+                    "Error: {e:?}\n\nFailed to get image links from post {}",
+                    post_url.as_str()
+                );
+                return Ok(());
             }
-            for post_url in post_urls {
-                let img_urls = match get_img_links_from_post(post_url, &client).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        bot.send_message(chat_id, format!("Ошибка зпроса: {:?}", e))
-                            .await?;
-                        HashSet::new()
-                    }
-                };
-                for img_url in img_urls {
-                    match download_image_to_memory(img_url.clone(), &client).await {
-                        Ok(photo) => {
-                            bot.send_document(chat_id, photo).await?;
-                        }
-                        Err(e) => {
-                            log::warn!("failed to download image {img_url}: {e:?}");
-                            let err_resp_text = format!(
-                                "не удалось скачать, какая-то проблема {e:?} со ссылкой:\n\n{}",
-                                img_url.to_string()
-                            );
-                            bot.send_message(chat_id, err_resp_text).await?;
-                        }
-                    }
+        };
+        let mut images = Vec::new();
+        for img_url in img_urls {
+            match download_image_to_memory(img_url.clone(), &client).await {
+                Ok(photo) => {
+                    images.push(InputMedia::Document(InputMediaDocument::new(photo)));
+                }
+                Err(err) => {
+                    log::warn!("failed to download image {img_url}: {err:?}");
+                    let err_resp_text = format!(
+                        "не удалось скачать, какая-то проблема со ссылкой:\n\n{}",
+                        img_url.as_str()
+                    );
+                    bot.send_message(chat_id, err_resp_text).await?;
+                    return Ok(());
                 }
             }
+        }
+        bot.send_media_group(chat_id, images).await?;
+    }
 
     Ok(())
 }
