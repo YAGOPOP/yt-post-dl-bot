@@ -5,6 +5,7 @@ use reqwest::{Client, header};
 // use teloxide::dispatching::dialogue::GetChatId;
 use std::collections::HashSet;
 // use std::sync::atomic::{AtomicUsize, Ordering};
+use html_escape::decode_html_entities;
 use teloxide::types::{InputFile, InputMediaDocument};
 use teloxide::types::{InputMedia, ReplyParameters};
 use teloxide::{prelude::*, utils::command::BotCommands};
@@ -185,7 +186,7 @@ async fn get_yt_post_text(post_text: String) -> Option<String> {
         let rest = &post_text[start + PREFIX.len()..];
         if let Some(end) = rest.find('"') {
             let description = &rest[..end];
-            return Some(description.into());
+            return Some(decode_html_entities(description).into());
         }
     }
     None
